@@ -1,0 +1,219 @@
+import os
+import numpy as np
+import pandas as pd
+
+
+try:
+    import talib
+    HAS_TALIB = True
+except Exception:
+    HAS_TALIB = False
+
+
+
+def _stoch_kd_pandas(high, low, close, fastk_period=9, slowk_period=5, slowd_period=5):
+    """ %K/%D (SMA smoothing) in [0,100] """
+    llv = low.rolling(fastk_period, min_periods=fastk_period).min()
+    hhv = high.rolling(fastk_period, min_periods=fastk_period).max()
+    fast_k = (close - llv) / (hhv - llv) * 100.0
+    slow_k = fast_k.rolling(slowk_period, min_periods=slowk_period).mean()
+    slow_d = slow_k.rolling(slowd_period, min_periods=slowd_period).mean()
+    return slow_k, slow_d
+
+def _macd_pandas(close, fast=12, slow=26, signal=9):
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    macd_signal = macd.ewm(span=signal, adjust=False).mean()
+    macd_hist = macd - macd_signal
+    return macd, macd_signal, macd_hist
+
+def _rsi_pandas(close, period=12):
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / (avg_loss.replace(0, np.nan))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def _mom_pandas(close, period=5):
+    return close - close.shift(period)
+
+def _ema_pandas(close, period=12):
+    return close.ewm(span=period, adjust=False).mean()
+
+
+
+def _calc_features_one_stock(g: pd.DataFrame) -> pd.DataFrame:
+    
+    g = g.sort_values("date").copy()
+
+    
+    g["ret_1"]  = g["close"].pct_change(1)
+    g["ret_5"]  = g["close"].pct_change(5)
+    g["ret_10"] = g["close"].pct_change(10)
+    g["ret_30"] = g["close"].pct_change(30)
+    g["future_10d_return"] = g["close"].shift(-10) / g["close"] - 1
+
+    g["sd_30"]   = g["ret_1"].rolling(30, min_periods=30).std()
+    g["skew_30"] = g["ret_1"].rolling(30, min_periods=30).skew()
+
+   
+    g["pct_vol"] = g["vol"].pct_change(1)
+
+   
+    g["close_open"] = (g["close"] - g["open"]) / g["open"]
+    g["high_low"]   = (g["high"]  - g["low"])  / g["low"].replace(0, np.nan)
+
+    g["pre_close"]     = g["close"].shift(1)
+    g["price_change"]  = g["close"] - g["pre_close"]
+    g["p_change_pct"]  = (g["price_change"] / g["pre_close"]) * 100.0
+
+    # 3) Moving averages
+    g["MA5"]  = g["close"].rolling(5,  min_periods=5).mean()
+    g["MA10"] = g["close"].rolling(10, min_periods=10).mean()
+
+    # 4) Technical indicators
+    close = g["close"].astype(float).values
+    high  = g["high"].astype(float).values
+    low   = g["low"].astype(float).values
+
+    if HAS_TALIB:
+        g["RSI_12"] = talib.RSI(close, timeperiod=12)
+        g["MOM_5"]  = talib.MOM(close, timeperiod=5)
+        g["EMA12"]  = talib.EMA(close, timeperiod=12)
+        g["EMA26"]  = talib.EMA(close, timeperiod=26)
+        macd, macds, macdh = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
+        g["MACD"] = macd
+        g["MACDsignal"] = macds
+        g["MACDhist"]   = macdh
+
+        # Use SMA smoothing for K/D to match common KDJ practice
+        K, D = talib.STOCH(high, low, close,
+                           fastk_period=9,
+                           slowk_period=5,  slowk_matype=0,
+                           slowd_period=5,  slowd_matype=0)
+        g["K"] = K; g["D"] = D
+    else:
+        g["RSI_12"] = _rsi_pandas(g["close"], 12)
+        g["MOM_5"]  = _mom_pandas(g["close"], 5)
+        g["EMA12"]  = _ema_pandas(g["close"], 12)
+        g["EMA26"]  = _ema_pandas(g["close"], 26)
+        macd, macds, macdh = _macd_pandas(g["close"], 12, 26, 9)
+        g["MACD"] = macd
+        g["MACDsignal"] = macds
+        g["MACDhist"]   = macdh
+        K, D = _stoch_kd_pandas(g["high"], g["low"], g["close"],
+                                fastk_period=9, slowk_period=5, slowd_period=5)
+        g["K"] = K; g["D"] = D
+
+    
+    g["J"] = 3.0 * g["K"] - 2.0 * g["D"]
+
+    # 5) Optional rolling z-score normalization (stock-wise)
+    for col in ["vol", "pct_vol", "price_change"]:
+        mu = g[col].rolling(120, min_periods=30).mean()
+        sd = g[col].rolling(120, min_periods=30).std()
+        g[col + "_z120"] = (g[col] - mu) / sd
+
+    
+    g = g.dropna().reset_index(drop=True)
+    return g
+
+
+
+def _detect_columns(df: pd.DataFrame):
+    # symbol
+    symbol_col = next((c for c in ["symbol", "ticker", "code", "ts_code"] if c in df.columns), None)
+    if symbol_col is None:
+        # if single stock only, fabricate a symbol column
+        symbol_col = "symbol"
+        df = df.copy()
+        df[symbol_col] = "SINGLE"
+
+    # date
+    date_col = next((c for c in ["date", "trade_date", "datetime", "time"] if c in df.columns), None)
+    if date_col is None:
+        raise ValueError("无法识别日期列（需包含 'date'/'trade_date'/'datetime'/'time' 之一）。")
+
+    # OHLCV
+    def pick(cands):
+        return next((c for c in cands if c in df.columns), None)
+
+    open_col  = pick(["open", "Open", "OPEN"])
+    high_col  = pick(["high", "High", "HIGH"])
+    low_col   = pick(["low", "Low", "LOW"])
+    close_col = pick(["close", "Close", "CLOSE", "adj_close", "Adj Close"])
+    vol_col   = pick(["vol", "volume", "Vol", "Volume", "VOL"])
+
+    missing = []
+    if open_col is None:  missing.append("open")
+    if high_col is None:  missing.append("high")
+    if low_col is None:   missing.append("low")
+    if close_col is None: missing.append("close")
+    if vol_col is None:   missing.append("vol/volume")
+    if missing:
+        raise ValueError(f"缺少必要列: {missing}")
+
+    return df, symbol_col, date_col, open_col, high_col, low_col, close_col, vol_col
+
+def _ensure_cols(df, symbol_col, date_col, open_col, high_col, low_col, close_col, vol_col):
+    """Map user columns to canonical names and coerce types."""
+    colmap = {
+        symbol_col: "symbol",
+        date_col:   "date",
+        open_col:   "open",
+        high_col:   "high",
+        low_col:    "low",
+        close_col:  "close",
+        vol_col:    "vol",
+    }
+    df = df.rename(columns=colmap).copy()
+    df["date"] = pd.to_datetime(df["date"])
+    for c in ["open","high","low","close","vol"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+
+def main():
+    src_path = "data.csv"
+    if not os.path.exists(src_path):
+        raise FileNotFoundError(f"找不到输入文件: {src_path}")
+
+    raw = pd.read_csv(src_path)
+
+    # Detect & normalize columns
+    raw, symbol_col, date_col, open_col, high_col, low_col, close_col, vol_col = _detect_columns(raw)
+    df = _ensure_cols(raw, symbol_col, date_col, open_col, high_col, low_col, close_col, vol_col)
+
+    # Sort
+    df = df.sort_values(["symbol", "date"]).copy()
+
+    # Explicit per-stock loop (no DeprecationWarning)
+    parts = []
+    for sym, g in df.groupby("symbol", sort=False):
+        part = _calc_features_one_stock(g.drop(columns=["symbol"], errors="ignore"))
+        part.insert(0, "symbol", sym)  # ensure symbol column present at front
+        parts.append(part)
+    features = pd.concat(parts, ignore_index=True)
+
+    # Save (overwrite)
+    out_path = "features_data.csv"
+    features.to_csv(out_path, index=False)
+    print(f"Saved features to: {out_path}")
+
+    # Optional: quick head print
+    cols = [c for c in ["symbol","date","open","high","low","close","vol",
+                        "ret_1","ret_5","sd_30","RSI_12","EMA12","EMA26","MACD","K","D","J",
+                        "MA5","MA10","pct_vol","price_change_z120","future_10d_return"]
+            if c in features.columns]
+    print(features[cols].head(10))
+
+
+if __name__ == "__main__":
+    main()
+
+
