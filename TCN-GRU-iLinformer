@@ -1,0 +1,1023 @@
+
+import os, json, math, random, time, warnings
+from typing import Optional, List, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.metrics import (
+    accuracy_score, precision_recall_fscore_support,
+    classification_report, confusion_matrix, f1_score
+)
+
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+DATA_DIR      = "processed"              
+OUT_DIR       = "TCN-GRU-iLinformer"     ）
+os.makedirs(OUT_DIR, exist_ok=True)
+
+SEED          = 42
+DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
+
+BATCH_SIZE    = 256
+EPOCHS        = 80
+BASE_LR       = 1e-4
+MIN_LR        = 1e-6
+WEIGHT_DECAY  = 1e-4
+WARMUP_EPOCHS = 2
+PATIENCE_ES   = 15
+
+D_MODEL       = 128
+N_HEADS       = 4
+FFN_EXPAND    = 4
+DROPOUT       = 0.1
+NUM_CLASSES   = 2
+
+LIN_K         = 32
+
+TCN_LEVELS      = 3
+TCN_KERNEL_SIZE = 3
+
+GRU_LAYERS      = 1
+GRU_BIDIR       = False
+GRU_DROPOUT     = 0.0
+
+EMA_ALPHA       = 0.2
+
+GAUSS_NOISE_STD = 0.0
+TIME_MASK_PROB  = 0.10
+TIME_MASK_MAX   = 3
+FEATURE_DROP_PROB = 0.03 
+
+LABEL_SMOOTHING = 0.05     
+USE_CLASS_WEIGHT = True    #
+USE_MODEL_EMA_EVAL = True  
+MODEL_EMA_DECAY = 0.999
+
+DATE_CANDIDATES  = ["Date","date","交易日期","时间","Datetime","datetime","日期"]
+OPEN_CANDIDATES  = ["open","Open","OPEN","开盘价","开盘"]
+CLOSE_CANDIDATES = ["close","Close","CLOSE","收盘价","收盘"]
+HIGH_CANDIDATES  = ["high","High","HIGH","最高价","最高"]
+LOW_CANDIDATES   = ["low","Low","LOW","最低价","最低"]
+STOCK_CANDIDATES = ["stock", "ticker", "ts_code", "code", "symbol", "证券代码", "股票代码", "S_INFO_WINDCODE"]
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def count_params(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def _save_json(path, obj):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def _detect_col(cols, candidates: List[str]) -> Optional[str]:
+    lowers = {c.lower(): c for c in cols}
+    for k in candidates:
+        if k.lower() in lowers:
+            return lowers[k.lower()]
+    for c in cols:
+        lc = c.lower()
+        for k in candidates:
+            if k.lower() in lc:
+                return c
+    return None
+
+def _parse_meta(meta_csv: str) -> Tuple[int, int]:
+    try:
+        df = pd.read_csv(meta_csv)
+        if "seq_len" in df.columns and "stride" in df.columns:
+            return int(df["seq_len"].iloc[0]), int(df["stride"].iloc[0])
+    except Exception:
+        pass
+    return 15, 1
+
+def _rows_from_windows(n_windows: int, seq_len: int, stride: int) -> int:
+    if n_windows <= 0:
+        return 0
+    return (n_windows - 1) * stride + seq_len
+
+
+class TSArrayDataset(Dataset):
+    """ X: [N, T, C], y: [N] """
+    def __init__(self, X: np.ndarray, y: np.ndarray, train: bool = False):
+        assert X.ndim == 3, f"X should be [N,T,C], got {X.shape}"
+        self.X = torch.from_numpy(X).float()
+        self.y = torch.from_numpy(y).long()
+        self.train_flag = train
+    def __len__(self):
+        return self.X.shape[0]
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+def add_train_time_aug(x_tensor: torch.Tensor) -> torch.Tensor:
+    # x_tensor: [B,T,C]
+    if GAUSS_NOISE_STD > 0:
+        x_tensor = x_tensor + GAUSS_NOISE_STD * torch.randn_like(x_tensor)
+    if FEATURE_DROP_PROB > 0:
+        # 按通道随机置零（不破坏时序结构）
+        if random.random() < FEATURE_DROP_PROB:
+            B, T, C = x_tensor.shape
+            drop_c = random.randint(0, C - 1)
+            x_tensor[:, :, drop_c] = 0.0
+    if TIME_MASK_PROB > 0:
+        B, L, D = x_tensor.shape
+        for b in range(B):
+            if random.random() < TIME_MASK_PROB:
+                m_len = random.randint(1, TIME_MASK_MAX)
+                start = random.randint(0, max(0, L - m_len))
+                x_tensor[b, start:start+m_len, :] = 0.0
+    return x_tensor
+
+
+class SmoothCELoss(nn.Module):
+    def __init__(self, num_classes: int, smoothing: float = 0.0, weight: Optional[torch.Tensor] = None):
+        super().__init__()
+        self.num_classes = int(num_classes)
+        self.smoothing = float(smoothing)
+        self.register_buffer("weight", weight if weight is not None else None, persistent=False)
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # logits: [B,C], target: [B]
+        log_probs = F.log_softmax(logits, dim=-1)  # [B,C]
+        nll = -log_probs.gather(dim=-1, index=target.unsqueeze(1)).squeeze(1)  # [B]
+        smooth = -log_probs.mean(dim=-1)  # [B]
+        loss = (1.0 - self.smoothing) * nll + self.smoothing * smooth
+
+        if self.weight is not None:
+            w = self.weight.gather(0, target)  # [B]
+            loss = loss * w
+        return loss.mean()
+
+def build_class_weight(y: np.ndarray, num_classes: int) -> np.ndarray:
+    cnt = np.bincount(y.astype(int), minlength=num_classes).astype(np.float64)
+    cnt[cnt == 0] = 1.0
+    w = cnt.sum() / (num_classes * cnt)          # inverse freq
+    w = w / (w.mean() + 1e-12)                   # normalize mean=1
+    return w.astype(np.float32)
+
+
+class ModelEMA:
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        self.backup = None
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        msd = model.state_dict()
+        for k, v in msd.items():
+            if k in self.shadow:
+                self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=(1.0 - self.decay))
+            else:
+                self.shadow[k] = v.detach().clone()
+
+    def apply_shadow(self, model: nn.Module):
+        self.backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(self.shadow, strict=True)
+
+    def restore(self, model: nn.Module):
+        if self.backup is not None:
+            model.load_state_dict(self.backup, strict=True)
+        self.backup = None
+
+
+class Chomp1d(nn.Module):
+    def __init__(self, chomp_size: int):
+        super().__init__()
+        self.chomp_size = chomp_size
+    def forward(self, x):
+        if self.chomp_size == 0:
+            return x
+        return x[:, :, :-self.chomp_size]
+
+class TemporalBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride,
+                 dilation, padding, dropout=0.1):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size,
+                               stride=stride, padding=padding, dilation=dilation)
+        self.chomp1 = Chomp1d(padding)
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size,
+                               stride=stride, padding=padding, dilation=dilation)
+        self.chomp2 = Chomp1d(padding)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.downsample = nn.Conv1d(in_channels, out_channels, kernel_size=1) \
+            if in_channels != out_channels else None
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.chomp1(out)
+        out = self.relu1(out)
+        out = self.dropout1(out)
+
+        out = self.conv2(out)
+        out = self.chomp2(out)
+        out = self.relu2(out)
+        out = self.dropout2(out)
+
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+class TemporalConvNet(nn.Module):
+    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.1):
+        super().__init__()
+        layers = []
+        for i in range(len(num_channels)):
+            dilation_size = 2 ** i
+            in_channels = num_inputs if i == 0 else num_channels[i-1]
+            out_channels = num_channels[i]
+            padding = (kernel_size - 1) * dilation_size
+            layers += [TemporalBlock(in_channels, out_channels, kernel_size,
+                                     stride=1, dilation=dilation_size,
+                                     padding=padding, dropout=dropout)]
+        self.network = nn.Sequential(*layers)
+    def forward(self, x):
+        return self.network(x)
+
+class TCNEncoder1D(nn.Module):
+  
+    def __init__(self, d_in: int, num_levels: int = 3,
+                 kernel_size: int = 3, dropout: float = 0.1):
+        super().__init__()
+        num_levels = max(1, int(num_levels))
+        num_channels = [d_in] * num_levels
+        self.tcn = TemporalConvNet(
+            num_inputs=d_in,
+            num_channels=num_channels,
+            kernel_size=kernel_size,
+            dropout=dropout
+        )
+        self.out_norm = nn.LayerNorm(d_in)
+
+    def forward(self, x: torch.Tensor):
+        x_perm = x.transpose(1, 2)  # [B,C,T]
+        y = self.tcn(x_perm).transpose(1, 2)  # [B,T,C]
+        out = x + y
+        return self.out_norm(out)
+
+
+class GRUTimeProjector(nn.Module):
+  
+    def __init__(self, d_model: int, hidden_size: int,
+                 in_feat: int = 3,
+                 num_layers: int = 1, bidir: bool = False,
+                 dropout: float = 0.0):
+        super().__init__()
+        self.hidden_size = int(hidden_size)
+        self.num_layers = int(num_layers)
+        self.bidir = bool(bidir)
+        self.in_feat = int(in_feat)
+
+        self.feat_norm = nn.LayerNorm(self.in_feat)
+
+        self.gru = nn.GRU(
+            input_size=self.in_feat,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            batch_first=True,
+            bidirectional=self.bidir,
+            dropout=(dropout if self.num_layers > 1 else 0.0)
+        )
+        out_dim = self.hidden_size * (2 if self.bidir else 1)
+        self.proj = nn.Sequential(
+            nn.LayerNorm(out_dim),
+            nn.Linear(out_dim, d_model)
+        )
+
+    def forward(self, x_feat: torch.Tensor):
+        # x_feat: [N,T,3]
+        x_feat = self.feat_norm(x_feat)
+        _, h_n = self.gru(x_feat)
+        if self.bidir:
+            h_last = torch.cat([h_n[-2], h_n[-1]], dim=-1)
+        else:
+            h_last = h_n[-1]
+        return self.proj(h_last)  # [N,d_model]
+
+
+class TransformerFFN(nn.Module):
+    def __init__(self, d_model: int, expand: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, d_model * expand),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * expand, d_model),
+            nn.Dropout(dropout),
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class LinformerSelfAttention(nn.Module):
+ 
+    def __init__(self, d_model: int, n_heads: int,
+                 num_tokens: int, k: int,
+                 dropout: float = 0.1):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.d_model   = d_model
+        self.n_heads   = n_heads
+        self.d_k       = d_model // n_heads
+        self.num_tokens = num_tokens
+        self.k         = k
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        self.E_k = nn.Parameter(torch.randn(num_tokens, k) * 0.02)
+        self.E_v = nn.Parameter(torch.randn(num_tokens, k) * 0.02)
+
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj_drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor):
+        B, L, D = x.size()
+        H = self.n_heads
+        assert L == self.num_tokens, f"Expected L={self.num_tokens}, got {L}"
+
+        q = self.q_proj(x).view(B, L, H, self.d_k).transpose(1, 2)  # [B,H,L,d_k]
+        k = self.k_proj(x).view(B, L, H, self.d_k).transpose(1, 2)
+        v = self.v_proj(x).view(B, L, H, self.d_k).transpose(1, 2)
+
+        k_lin = torch.einsum("lk,bhld->bhkd", self.E_k, k)  # [B,H,k,d_k]
+        v_lin = torch.einsum("lk,bhld->bhkd", self.E_v, v)  # [B,H,k,d_k]
+
+        scores = torch.matmul(q, k_lin.transpose(-2, -1)) / math.sqrt(self.d_k)  # [B,H,L,k]
+        attn = torch.softmax(scores, dim=-1)
+        attn = self.attn_drop(attn)
+
+        out = torch.matmul(attn, v_lin)  # [B,H,L,d_k]
+        out = out.transpose(1, 2).contiguous().view(B, L, D)
+        out = self.proj_drop(self.out_proj(out))
+        return out
+
+class ILinformerLayer(nn.Module):
+    def __init__(self, d_model: int, n_heads: int,
+                 num_tokens: int, k: int,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn  = LinformerSelfAttention(
+            d_model=d_model, n_heads=n_heads, num_tokens=num_tokens, k=k, dropout=dropout
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn   = TransformerFFN(d_model, expand=FFN_EXPAND, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
+
+        self.gate = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x: torch.Tensor):
+        # Attn
+        res = x
+        x_attn = self.attn(self.norm1(x))
+        x = res + self.dropout(x_attn)
+
+        # Gate (token-wise)
+        x = x * self.gate(x)
+
+        # FFN
+        res = x
+        x_ffn = self.ffn(self.norm2(x))
+        x = res + self.dropout(x_ffn)
+        return x
+
+class ILinformerEncoder(nn.Module):
+
+    def __init__(self, d_in: int, seq_len: int,
+                 d_model: int, n_heads: int,
+                 num_layers: int = 3,
+                 k: int = 32,
+                 dropout: float = 0.1,
+                 gru_layers: int = 1,
+                 gru_bidir: bool = False,
+                 gru_dropout: float = 0.0,
+                 ema_alpha: float = 0.2):
+        super().__init__()
+        self.d_in    = d_in
+        self.seq_len = seq_len
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.num_layers = int(num_layers)
+        self.k = int(k)
+        self.ema_alpha = float(ema_alpha)
+
+        self.time_gru = GRUTimeProjector(
+            d_model=d_model,
+            hidden_size=d_model,
+            in_feat=3,
+            num_layers=gru_layers,
+            bidir=gru_bidir,
+            dropout=gru_dropout
+        )
+
+        self.token_emb = nn.Parameter(torch.zeros(1, d_in, d_model))
+        nn.init.trunc_normal_(self.token_emb, std=0.02)
+
+        self.in_norm = nn.LayerNorm(d_model)
+        self.in_drop = nn.Dropout(dropout)
+
+        self.layers = nn.ModuleList([
+            ILinformerLayer(d_model=d_model, n_heads=n_heads, num_tokens=d_in, k=k, dropout=dropout)
+            for _ in range(self.num_layers)
+        ])
+        self.norm_out = nn.LayerNorm(d_model)
+
+        self.pool_score = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, 1)
+        )
+
+        self.route_scale = nn.Parameter(torch.ones(3))
+
+    def _build_feats_routeA(self, x_2d: torch.Tensor) -> torch.Tensor:
+
+        N, T = x_2d.shape
+        x0 = x_2d
+
+        x_shift = torch.cat([x0[:, :1], x0[:, :-1]], dim=1)
+        diff = x0 - x_shift
+
+        a = self.ema_alpha
+        ema = torch.zeros_like(x0)
+        ema[:, 0] = x0[:, 0]
+        for t in range(1, T):
+            ema[:, t] = a * x0[:, t] + (1.0 - a) * ema[:, t-1]
+
+        feats = torch.stack([x0, diff, ema], dim=-1)  # [N,T,3]
+        feats = feats * self.route_scale.view(1, 1, 3)
+        return feats
+
+    def _attn_pool(self, h: torch.Tensor) -> torch.Tensor:
+        # h: [B,C,D]
+        scores = self.pool_score(h).squeeze(-1)          # [B,C]
+        w = torch.softmax(scores, dim=1).unsqueeze(-1)   # [B,C,1]
+        return (h * w).sum(dim=1)                        # [B,D]
+
+    def forward(self, x: torch.Tensor):
+        B, T, C = x.shape
+        assert T == self.seq_len, f"Expected seq_len={self.seq_len}, got {T}"
+        assert C == self.d_in,    f"Expected d_in={self.d_in}, got {C}"
+
+        x = x.permute(0, 2, 1)          # [B,C,T]
+        x_2d = x.reshape(B * C, T)      # [B*C,T]
+
+        feats = self._build_feats_routeA(x_2d)           # [B*C,T,3]
+        tok = self.time_gru(feats).view(B, C, self.d_model)  # [B,C,D]
+
+        h = self.in_norm(tok + self.token_emb[:, :C, :])
+        h = self.in_drop(h)
+
+        for layer in self.layers:
+            h = layer(h)
+
+        h = self.norm_out(h)
+        attn_pool = self._attn_pool(h)      # [B,D]
+        max_pool  = h.max(dim=1).values     # [B,D]
+        out = torch.cat([attn_pool, max_pool], dim=-1)  # [B,2D]
+        return out
+
+class TCNGRUILinformerClassifier(nn.Module):
+
+    def __init__(self, d_in: int, seq_len: int,
+                 num_classes: int = 2,
+                 d_model: int = 128,
+                 n_heads: int = 4,
+                 num_layers: int = 3,
+                 k: int = 32,
+                 dropout: float = 0.1,
+                 tcn_levels: int = 3,
+                 tcn_kernel_size: int = 3,
+                 gru_layers: int = 1,
+                 gru_bidir: bool = False,
+                 gru_dropout: float = 0.0,
+                 ema_alpha: float = 0.2):
+        super().__init__()
+        self.tcn = TCNEncoder1D(
+            d_in=d_in,
+            num_levels=tcn_levels,
+            kernel_size=tcn_kernel_size,
+            dropout=dropout
+        )
+        self.encoder = ILinformerEncoder(
+            d_in=d_in,
+            seq_len=seq_len,
+            d_model=d_model,
+            n_heads=n_heads,
+            num_layers=num_layers,
+            k=k,
+            dropout=dropout,
+            gru_layers=gru_layers,
+            gru_bidir=gru_bidir,
+            gru_dropout=gru_dropout,
+            ema_alpha=ema_alpha
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model * 2),
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor):
+        z = self.tcn(x)          # [B,T,C]
+        h = self.encoder(z)      # [B,2*d_model]
+        logits = self.head(h)
+        return logits
+
+
+class WarmupCosine:
+    def __init__(self, optimizer, warmup_steps: int, total_steps: int, base_lr: float, min_lr: float):
+        self.optimizer = optimizer
+        self.warmup_steps = max(1, warmup_steps)
+        self.total_steps  = max(self.warmup_steps + 1, total_steps)
+        self.base_lr = base_lr
+        self.min_lr = min_lr
+        self.step_id = 0
+        self._set_lr(0.0)
+    def _set_lr(self, lr):
+        for pg in self.optimizer.param_groups:
+            pg["lr"] = lr
+    def step(self):
+        self.step_id += 1
+        if self.step_id <= self.warmup_steps:
+            lr = self.base_lr * self.step_id / float(self.warmup_steps)
+        else:
+            t = (self.step_id - self.warmup_steps) / float(max(1, self.total_steps - self.warmup_steps))
+            lr = self.min_lr + 0.5 * (self.base_lr - self.min_lr) * (1 + math.cos(math.pi * t))
+        self._set_lr(lr)
+    def get_last_lr(self):
+        return self.optimizer.param_groups[0]["lr"]
+
+
+def softmax_np(logits):
+    z = logits - logits.max(axis=1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=1, keepdims=True)
+
+@torch.no_grad()
+def evaluate_refstyle(model, loader, device, loss_fn, num_classes=2):
+    model.eval()
+    all_logits, all_y, loss_sum, n = [], [], 0.0, 0
+    for Xb, yb in loader:
+        Xb = Xb.to(device); yb = yb.to(device)
+        logits = model(Xb)
+        loss = loss_fn(logits, yb)
+        loss_sum += loss.item() * Xb.size(0); n += Xb.size(0)
+        all_logits.append(logits.detach().cpu().numpy())
+        all_y.append(yb.detach().cpu().numpy())
+    all_logits = np.concatenate(all_logits, axis=0) if all_logits else np.zeros((0, num_classes))
+    all_y = np.concatenate(all_y, axis=0) if all_y else np.zeros((0,), dtype=int)
+    probs = softmax_np(all_logits)
+    preds = all_logits.argmax(axis=1)
+
+    avg_loss = loss_sum / max(1, n)
+    acc = accuracy_score(all_y, preds)
+    prec, rec, f1, _ = precision_recall_fscore_support(all_y, preds, labels=list(range(num_classes)), zero_division=0)
+    macro_f1 = f1_score(all_y, preds, average="macro", zero_division=0)
+
+    metrics = {
+        "loss": float(avg_loss), "accuracy": float(acc), "macro_f1": float(macro_f1),
+        "precision_class0": float(prec[0] if num_classes>0 else 0.0),
+        "recall_class0":    float(rec[0]  if num_classes>0 else 0.0),
+        "f1_class0":        float(f1[0]   if num_classes>0 else 0.0),
+        "precision_class1": float(prec[1] if num_classes>1 else 0.0),
+        "recall_class1":    float(rec[1]  if num_classes>1 else 0.0),
+        "f1_class1":        float(f1[1]   if num_classes>1 else 0.0),
+    }
+    return metrics, preds, probs, all_y
+
+
+def plot_confusion_percent(y_true, y_pred, save_path, labels=("Down(0)","Up(1)")):
+    cm = confusion_matrix(y_true, y_pred, labels=[0,1]).astype(np.float64)
+    row_sums = cm.sum(axis=1, keepdims=True); row_sums[row_sums == 0] = 1.0
+    cm_pct = cm / row_sums * 100.0
+    plt.figure(figsize=(5.2, 4.4))
+    plt.imshow(cm_pct, interpolation='nearest', cmap='Blues')
+    plt.colorbar(fraction=0.046, pad=0.04)
+    tick = np.arange(len(labels)); plt.xticks(tick, labels); plt.yticks(tick, labels)
+    thr = cm_pct.max() / 2.0 if cm_pct.size > 0 else 50.0
+    for i in range(cm_pct.shape[0]):
+        for j in range(cm_pct.shape[1]):
+            txt = f"{cm_pct[i, j]:.1f}%"
+            plt.text(j, i, txt, ha="center", va="center",
+                     color="white" if cm_pct[i, j] > thr else "black")
+    plt.ylabel("True"); plt.xlabel("Predicted"); plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight"); plt.close()
+
+def plot_curves(history, save_loss_path, save_acc_path, save_f1_path):
+    df = pd.DataFrame(history)
+    plt.figure(figsize=(7,5))
+    plt.plot(df["epoch"], df["train_loss"], label="train_loss")
+    plt.plot(df["epoch"], df["val_loss"], label="val_loss")
+    plt.xlabel("epoch"); plt.ylabel("loss"); plt.legend()
+    plt.tight_layout(); plt.savefig(save_loss_path, dpi=300); plt.close()
+
+    if "train_acc" in df.columns and "val_acc" in df.columns:
+        plt.figure(figsize=(7,5))
+        plt.plot(df["epoch"], df["train_acc"], label="train_acc")
+        plt.plot(df["epoch"], df["val_acc"], label="val_acc")
+        plt.xlabel("epoch"); plt.ylabel("accuracy"); plt.legend()
+        plt.tight_layout(); plt.savefig(save_acc_path, dpi=300); plt.close()
+
+    if "train_macro_f1" in df.columns and "val_macro_f1" in df.columns:
+        plt.figure(figsize=(7,5))
+        plt.plot(df["epoch"], df["train_macro_f1"], label="train_macro_f1")
+        plt.plot(df["epoch"], df["val_macro_f1"], label="val_macro_f1")
+        plt.xlabel("epoch"); plt.ylabel("macro-F1"); plt.legend()
+        plt.tight_layout(); plt.savefig(save_f1_path, dpi=300); plt.close()
+
+def plot_prob_histograms(y_true, probs, save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+    for c in range(probs.shape[1]):
+        p_c = probs[:, c]
+        idx_true_c = (y_true == c); idx_not_c  = ~idx_true_c
+        plt.figure(figsize=(7,5))
+        plt.hist(p_c[idx_true_c], bins=30, alpha=0.65, label=f"True class = {c}")
+        plt.hist(p_c[idx_not_c], bins=30, alpha=0.65, label=f"True class != {c}")
+        plt.xlabel(f"Predicted probability for class {c}")
+        plt.ylabel("Count"); plt.title(f"Probability Histogram - Class {c}")
+        plt.legend(); plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, f"prob_hist_class_{c}.png"), dpi=300); plt.close()
+
+def plot_misclassified_examples(X, y_true, y_pred, save_dir, max_plots=6, features_to_show=3):
+    os.makedirs(save_dir, exist_ok=True)
+    mis_idx = np.where(y_true != y_pred)[0]
+    if mis_idx.size == 0:
+        plt.figure(figsize=(6,3)); plt.text(0.5, 0.5, "No misclassified samples.", ha="center", va="center")
+        plt.axis("off"); plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, "misclassified_none.png"), dpi=300); plt.close(); return
+    pick = mis_idx[:max_plots]
+    for k, i in enumerate(pick):
+        seq = X[i]  # [L, D]
+        L, D = seq.shape; fmax = min(features_to_show, D)
+        plt.figure(figsize=(7,4))
+        for f in range(fmax):
+            plt.plot(range(L), seq[:, f], label=f"Feature {f}")
+        plt.title(f"Misclassified #{k+1} (idx={i}) | True={y_true[i]} Pred={y_pred[i]}")
+        plt.xlabel("Time step"); plt.ylabel("Standardized value"); plt.legend()
+        plt.tight_layout(); plt.savefig(os.path.join(save_dir, f"mis_sample_{k+1}.png"), dpi=300); plt.close()
+
+def save_metrics_table_binary(precs, recs, f1s, acc, macro_f1, loss, save_csv, save_png, floatfmt=".4f"):
+    columns = ["DOWN(0)", "UP(1)"]
+    df = pd.DataFrame({"row": ["Precision","Recall","F1-Measure","Accuracy","Macro-F1","LOSS"]}).set_index("row")
+    df[columns[0]] = [precs[0], recs[0], f1s[0], acc, macro_f1, loss]
+    df[columns[1]] = [precs[1], recs[1], f1s[1], acc, macro_f1, loss]
+    df.to_csv(save_csv, encoding="utf-8-sig")
+    fig, ax = plt.subplots(figsize=(7.2, 3.0)); ax.axis("off")
+    table_data = [[f"{v:{floatfmt}}" for v in df.loc[row, columns].values] for row in df.index]
+    table = ax.table(cellText=table_data, rowLabels=df.index.tolist(), colLabels=columns,
+                     loc="center", cellLoc="center", rowLoc="center")
+    table.auto_set_font_size(False); table.set_fontsize(10); table.scale(1.15, 1.15)
+    for (row, col), cell in table.get_celld().items():
+        if row == 0: cell.set_text_props(weight="bold")
+        if col == -1: cell.set_text_props(weight="bold")
+    plt.tight_layout(); plt.savefig(save_png, dpi=300); plt.close()
+    widths = [12, 12, 12]
+    header = ["", *columns]; print("".join(h.ljust(w) for h, w in zip(header, widths)))
+    for row in df.index:
+        vals = [row] + [f"{df.at[row, c]:{floatfmt}}" for c in columns]
+        print("".join(v.ljust(w) for v, w in zip(vals, widths)))
+    print("[Note] Macro-F1 为整体指标，表格两列为同一数值，方便对齐展示。")
+
+
+def main():
+    set_seed(SEED)
+    if DEVICE == "cuda":
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+    print(f"Device: {DEVICE}")
+
+    X_train = np.load(os.path.join(DATA_DIR, "X_train.npy"))
+    y_train = np.load(os.path.join(DATA_DIR, "y_train.npy"))
+    X_val   = np.load(os.path.join(DATA_DIR, "X_val.npy"))
+    y_val   = np.load(os.path.join(DATA_DIR, "y_val.npy"))
+    X_test  = np.load(os.path.join(DATA_DIR, "X_test.npy"))
+    y_test  = np.load(os.path.join(DATA_DIR, "y_test.npy"))
+
+    Ntr, L, Din = X_train.shape
+    print(f"Train: X={X_train.shape}, y={y_train.shape}")
+    print(f"Val  : X={X_val.shape},   y={y_val.shape}")
+    print(f"Test : X={X_test.shape},  y={y_test.shape}")
+
+    ds_tr = TSArrayDataset(X_train, y_train, train=True)
+    ds_va = TSArrayDataset(X_val, y_val, train=False)
+    ds_te = TSArrayDataset(X_test, y_test, train=False)
+    dl_tr = DataLoader(ds_tr, batch_size=BATCH_SIZE, shuffle=True,  drop_last=False, num_workers=0, pin_memory=True)
+    dl_va = DataLoader(ds_va, batch_size=BATCH_SIZE, shuffle=False, drop_last=False, num_workers=0, pin_memory=True)
+    dl_te = DataLoader(ds_te, batch_size=BATCH_SIZE, shuffle=False, drop_last=False, num_workers=0, pin_memory=True)
+
+    model = TCNGRUILinformerClassifier(
+        d_in=Din,
+        seq_len=L,
+        num_classes=NUM_CLASSES,
+        d_model=D_MODEL,
+        n_heads=N_HEADS,
+        num_layers=3,
+        k=LIN_K,
+        dropout=DROPOUT,
+        tcn_levels=TCN_LEVELS,
+        tcn_kernel_size=TCN_KERNEL_SIZE,
+        gru_layers=GRU_LAYERS,
+        gru_bidir=GRU_BIDIR,
+        gru_dropout=GRU_DROPOUT,
+        ema_alpha=EMA_ALPHA
+    ).to(DEVICE)
+    print(f"Model params: {count_params(model):,}")
+
+    class_weight_t = None
+    if USE_CLASS_WEIGHT:
+        w = build_class_weight(y_train, NUM_CLASSES)
+        class_weight_t = torch.tensor(w, dtype=torch.float32, device=DEVICE)
+        print("[Info] class_weight:", w.tolist())
+
+    criterion = SmoothCELoss(
+        num_classes=NUM_CLASSES,
+        smoothing=LABEL_SMOOTHING,
+        weight=class_weight_t
+    )
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=BASE_LR, weight_decay=WEIGHT_DECAY)
+    total_steps = len(dl_tr) * EPOCHS
+    warmup_steps = max(1, int(len(dl_tr) * WARMUP_EPOCHS))
+    lr_sched = WarmupCosine(optimizer, warmup_steps, total_steps, BASE_LR, MIN_LR)
+
+    ema = ModelEMA(model, decay=MODEL_EMA_DECAY) if USE_MODEL_EMA_EVAL else None
+
+    best_val = -1.0
+    best_state, best_epoch, es_counter = None, -1, 0
+    history = []
+
+    for epoch in range(1, EPOCHS + 1):
+        t0 = time.time()
+        model.train()
+        loss_sum, n_sum, correct = 0.0, 0, 0
+
+        for Xb, yb in dl_tr:
+            Xb = Xb.to(DEVICE); yb = yb.to(DEVICE)
+            Xb = add_train_time_aug(Xb)
+
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(Xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            lr_sched.step()
+
+            if ema is not None:
+                ema.update(model)
+
+            bs = Xb.size(0)
+            loss_sum += loss.item() * bs
+            n_sum += bs
+            pred = logits.argmax(dim=-1)
+            correct += (pred == yb).sum().item()
+
+        train_loss = loss_sum / max(1, n_sum)
+        train_acc = correct / max(1, n_sum)
+
+        if ema is not None:
+            ema.apply_shadow(model)
+            train_metrics, _, _, _ = evaluate_refstyle(model, dl_tr, DEVICE, criterion, NUM_CLASSES)
+            val_metrics,   _, _, _ = evaluate_refstyle(model, dl_va, DEVICE, criterion, NUM_CLASSES)
+            ema.restore(model)
+        else:
+            train_metrics, _, _, _ = evaluate_refstyle(model, dl_tr, DEVICE, criterion, NUM_CLASSES)
+            val_metrics,   _, _, _ = evaluate_refstyle(model, dl_va, DEVICE, criterion, NUM_CLASSES)
+
+        log = {
+            "epoch": epoch,
+            "train_loss": float(train_loss),
+            "val_loss": float(val_metrics["loss"]),
+            "train_acc": float(train_acc),
+            "val_acc": float(val_metrics["accuracy"]),
+            "train_macro_f1": float(train_metrics["macro_f1"]),
+            "val_macro_f1": float(val_metrics["macro_f1"]),
+            "lr": float(optimizer.param_groups[0]["lr"]),
+            "time_sec": round(time.time() - t0, 2)
+        }
+        history.append(log); print(log)
+
+        if val_metrics["macro_f1"] > best_val + 1e-6:
+            best_val = val_metrics["macro_f1"]
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_epoch = epoch; es_counter = 0
+        else:
+            es_counter += 1
+        if es_counter >= PATIENCE_ES:
+            print(f"Early stopping at epoch {epoch}. Best epoch {best_epoch}, val_macro_f1={best_val:.6f}")
+            break
+
+    pd.DataFrame(history).to_csv(os.path.join(OUT_DIR, "training_log.csv"), index=False, encoding="utf-8-sig")
+    plot_curves(history,
+                save_loss_path=os.path.join(OUT_DIR, "curves_loss.png"),
+                save_acc_path=os.path.join(OUT_DIR, "curves_accuracy.png"),
+                save_f1_path=os.path.join(OUT_DIR, "curves_macro_f1.png"))
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    torch.save(model.state_dict(), os.path.join(OUT_DIR, "best_model.pth"))
+
+    if ema is not None:
+        # 用最终EMA做 test 输出（提升信号稳定性）
+        ema.apply_shadow(model)
+        test_metrics, y_pred, probs, y_true = evaluate_refstyle(model, dl_te, DEVICE, criterion, NUM_CLASSES)
+        ema.restore(model)
+    else:
+        test_metrics, y_pred, probs, y_true = evaluate_refstyle(model, dl_te, DEVICE, criterion, NUM_CLASSES)
+
+    print("==== Test Metrics ===="); print(test_metrics)
+    pd.DataFrame([test_metrics]).to_csv(os.path.join(OUT_DIR, "metrics_test.csv"), index=False, encoding="utf-8-sig")
+
+    rpt = classification_report(y_true, y_pred, labels=[0,1], digits=4, zero_division=0, output_dict=True)
+    with open(os.path.join(OUT_DIR, "classification_report.json"), "w", encoding="utf-8") as f:
+        json.dump(rpt, f, ensure_ascii=False, indent=2)
+
+    pd.DataFrame({"y_true": y_true.astype(int), "y_pred": y_pred.astype(int)}).to_csv(
+        os.path.join(OUT_DIR, "pred_vs_true_test.csv"), index=False, encoding="utf-8-sig"
+    )
+
+    plot_confusion_percent(y_true, y_pred, os.path.join(OUT_DIR, "confusion_matrix_percent.png"))
+    plot_prob_histograms(y_true, probs, save_dir=os.path.join(OUT_DIR, "prob_histograms"))
+    plot_misclassified_examples(
+        X_test, y_true, y_pred, save_dir=os.path.join(OUT_DIR, "misclassified_plots"),
+        max_plots=6, features_to_show=3
+    )
+
+    precs = np.array([test_metrics["precision_class0"], test_metrics["precision_class1"]], dtype=float)
+    recs  = np.array([test_metrics["recall_class0"],    test_metrics["recall_class1"]], dtype=float)
+    f1s   = np.array([test_metrics["f1_class0"],        test_metrics["f1_class1"]], dtype=float)
+    acc   = float(test_metrics["accuracy"])
+    macro_f1 = float(test_metrics["macro_f1"])
+    loss  = float(test_metrics["loss"])
+    save_metrics_table_binary(
+        precs, recs, f1s, acc, macro_f1, loss,
+        save_csv=os.path.join(OUT_DIR, "metrics_table.csv"),
+        save_png=os.path.join(OUT_DIR, "metrics_table.png"),
+        floatfmt=".4f"
+    )
+
+    if probs.shape[1] != 2:
+        raise RuntimeError(f"期望二分类概率 shape [N,2]，实际 {probs.shape}")
+    np.save(os.path.join(OUT_DIR, "test_probs.npy"), probs)
+
+    score = probs[:, 1] - probs[:, 0]  
+    signal = (probs[:, 1] >= 0.5).astype(int)
+
+    pd.DataFrame({
+        "y_true": y_true.astype(int),
+        "y_pred": y_pred.astype(int),
+        "probs_down": probs[:, 0],
+        "probs_up": probs[:, 1],
+        "score": score,
+        "signal": signal
+    }).to_csv(os.path.join(OUT_DIR, "preds_test.csv"), index=False, encoding="utf-8-sig")
+
+    summary = {
+        "model_type": "TCN-GRU-iLinformer(RouteA-x-diff-ema, gated+attnpool, smoothCE, EMAeval)",
+        "data_dir": DATA_DIR,
+        "out_dir": OUT_DIR,
+        "input_shape": [int(Ntr), int(L), int(Din)],
+        "model_params": int(count_params(model)),
+        "best_epoch": int(best_epoch),
+        "best_val_macro_f1": round(float(best_val), 6),
+        "test": test_metrics,
+        "config": {
+            "BATCH_SIZE": BATCH_SIZE,
+            "EPOCHS": EPOCHS,
+            "BASE_LR": BASE_LR,
+            "MIN_LR": MIN_LR,
+            "WEIGHT_DECAY": WEIGHT_DECAY,
+            "WARMUP_EPOCHS": WARMUP_EPOCHS,
+            "PATIENCE_ES": PATIENCE_ES,
+            "D_MODEL": D_MODEL,
+            "N_HEADS": N_HEADS,
+            "FFN_EXPAND": FFN_EXPAND,
+            "DROPOUT": DROPOUT,
+            "LIN_K": LIN_K,
+            "TCN_LEVELS": TCN_LEVELS,
+            "TCN_KERNEL_SIZE": TCN_KERNEL_SIZE,
+            "GRU_LAYERS": GRU_LAYERS,
+            "GRU_BIDIR": GRU_BIDIR,
+            "GRU_DROPOUT": GRU_DROPOUT,
+            "EMA_ALPHA": EMA_ALPHA,
+            "LABEL_SMOOTHING": LABEL_SMOOTHING,
+            "USE_CLASS_WEIGHT": USE_CLASS_WEIGHT,
+            "USE_MODEL_EMA_EVAL": USE_MODEL_EMA_EVAL,
+            "MODEL_EMA_DECAY": MODEL_EMA_DECAY,
+            "GAUSS_NOISE_STD": GAUSS_NOISE_STD,
+            "TIME_MASK_PROB": TIME_MASK_PROB,
+            "TIME_MASK_MAX": TIME_MASK_MAX,
+            "FEATURE_DROP_PROB": FEATURE_DROP_PROB
+        }
+    }
+    _save_json(os.path.join(OUT_DIR, "metrics.json"), summary)
+
+    meta_csv = os.path.join(DATA_DIR, "meta_summary.csv")
+    aligned_csv = os.path.join(DATA_DIR, "features_labels_aligned.csv")
+    if os.path.exists(meta_csv) and os.path.exists(aligned_csv):
+        try:
+            seq_len_meta, stride_meta = _parse_meta(meta_csv)
+            n_tr_rows = _rows_from_windows(X_train.shape[0], seq_len_meta, stride_meta)
+            n_va_rows = _rows_from_windows(X_val.shape[0],   seq_len_meta, stride_meta)
+            te0 = n_tr_rows + n_va_rows
+
+            end_indices = np.arange(te0 + (seq_len_meta - 1),
+                                    te0 + (seq_len_meta - 1) + stride_meta * X_test.shape[0],
+                                    stride_meta, dtype=int)
+
+            df_aln = pd.read_csv(aligned_csv)
+            date_col  = _detect_col(df_aln.columns, DATE_CANDIDATES)
+            open_col  = _detect_col(df_aln.columns, OPEN_CANDIDATES)
+            close_col = _detect_col(df_aln.columns, CLOSE_CANDIDATES)
+            high_col  = _detect_col(df_aln.columns, HIGH_CANDIDATES)
+            low_col   = _detect_col(df_aln.columns, LOW_CANDIDATES)
+            stock_col = _detect_col(df_aln.columns, STOCK_CANDIDATES)
+
+            if date_col is None:
+                raise RuntimeError("无法识别日期列")
+            if open_col is None or close_col is None:
+                warnings.warn("[Warn] 未识别到 open/close 列，将以 NaN 填充价格。")
+            if high_col is None or low_col is None:
+                warnings.warn("[Warn] 未识别到 high/low 列，将以 NaN 填充价格。")
+            if stock_col is None:
+                warnings.warn("[Warn] 未识别到股票代码列，将在回测导出中不包含 stock_id。")
+
+            end_indices = np.clip(end_indices, 0, len(df_aln)-1)
+            end_indices_next = np.clip(end_indices + 1, 0, len(df_aln) - 1)
+
+            df_bt = pd.DataFrame({
+                "idx_t": end_indices,
+                "date_t": pd.to_datetime(df_aln.loc[end_indices, date_col].values, errors="coerce")
+            })
+            if stock_col is not None and stock_col in df_aln.columns:
+                df_bt["stock_id"] = df_aln.loc[end_indices, stock_col].values
+
+            df_bt["open_t"]  = df_aln.loc[end_indices, open_col].values  if open_col  in df_aln.columns else np.nan
+            df_bt["close_t"] = df_aln.loc[end_indices, close_col].values if close_col in df_aln.columns else np.nan
+            df_bt["high_t"]  = df_aln.loc[end_indices, high_col].values  if high_col  in df_aln.columns else np.nan
+            df_bt["low_t"]   = df_aln.loc[end_indices, low_col].values   if low_col   in df_aln.columns else np.nan
+
+            df_bt["date_t1"]  = pd.to_datetime(df_aln.loc[end_indices_next, date_col].values, errors="coerce")
+            df_bt["open_t1"]  = df_aln.loc[end_indices_next, open_col].values  if open_col  in df_aln.columns else np.nan
+            df_bt["close_t1"] = df_aln.loc[end_indices_next, close_col].values if close_col in df_aln.columns else np.nan
+            df_bt["high_t1"]  = df_aln.loc[end_indices_next, high_col].values  if high_col  in df_aln.columns else np.nan
+            df_bt["low_t1"]   = df_aln.loc[end_indices_next, low_col].values   if low_col   in df_aln.columns else np.nan
+
+            df_bt["probs_down"] = probs[:, 0]
+            df_bt["probs_up"]   = probs[:, 1]
+            df_bt["score"]      = score
+            df_bt["signal"]     = signal
+            df_bt["y_pred"]     = y_pred.astype(int)
+            df_bt["y_true"]     = y_true.astype(int)
+            df_bt["date"]       = pd.to_datetime(df_bt["date_t"], errors="coerce")
+            df_bt["date_str"]   = df_bt["date"].dt.strftime("%Y-%m-%d")
+
+            backtest_csv = os.path.join(OUT_DIR, "preds_test_with_prices.csv")
+            df_bt.to_csv(backtest_csv, index=False, encoding="utf-8-sig")
+
+            if len(df_bt) != len(y_test):
+                print(f"[Warn] 对齐行数与测试样本数不一致：df_bt={len(df_bt)} vs y_test={len(y_test)}。"
+                      f"请检查 meta_summary.csv 的 seq_len/stride 是否与预处理一致。")
+            print("Backtest export:", backtest_csv)
+        except Exception as e:
+            print(f"[Info] 跳过回测导出：{e}")
+    else:
+        print("[Info] 未检测到 meta_summary.csv 或 features_labels_aligned.csv，跳过回测导出。")
+
+    print("All done. Results in:", OUT_DIR)
+
+
+if __name__ == "__main__":
+    main()
